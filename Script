@@ -1,0 +1,443 @@
+import re
+import unicodedata
+from collections import Counter
+from itertools import combinations
+from pathlib import Path
+from urllib.parse import urlparse
+ 
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import networkx as nx
+from sklearn.feature_extraction.text import TfidfVectorizer
+ 
+import nltk
+try:
+    from nltk.corpus import stopwords
+    stopwords.words("portuguese")
+except LookupError:
+    nltk.download("stopwords", quiet=True)
+    from nltk.corpus import stopwords
+ 
+try:
+    from wordcloud import WordCloud
+    HAS_WORDCLOUD = True
+except ImportError:
+    HAS_WORDCLOUD = False
+    print("Aviso: wordcloud não instalado; etapa de nuvem de palavras será pulada.")
+ 
+# ============================================================
+# CONFIGURAÇÕES
+# ============================================================
+INPUT_PATH = Path(r"C:\Users\viihb\Downloads\Sistema_de_busca_05_de_mai_de_2026.xlsx")
+OUTPUT_DIR = INPUT_PATH.parent / "resultados_analise"
+OUTPUT_DIR.mkdir(exist_ok=True)
+OUT_XLSX = OUTPUT_DIR / "resultados_analise.xlsx"
+ 
+TEXT_COLS = ["article title", "article description"]
+QUERY_COL = "query"
+URL_COL = "article url"
+SOURCE_CATEGORY_COL = "Categoria da fonte"
+ 
+TOP_N_TFIDF = 30
+TOP_N_COOC = 40
+TOP_N_DISTINCTIVE = 25
+ 
+# ============================================================
+# STOPWORDS — NLTK português + adições editoriais
+# ============================================================
+PT_STOP = set(stopwords.words("portuguese"))
+ 
+CUSTOM_STOP = {
+    # verbos de altíssima frequência
+    "ser", "ter", "estar", "haver", "fazer", "ir", "vir", "dar", "ver",
+    "saber", "dizer", "ficar", "poder", "querer", "passar", "dever",
+    # advérbios/conectivos
+    "ate", "ainda", "tambem", "apos", "sobre", "agora", "hoje",
+    "ontem", "amanha", "porque", "pois", "entao", "assim", "como",
+    "quando", "onde", "qual", "quais", "que", "quem", "porem", "mas",
+    "embora", "todo", "toda", "todos", "todas", "outro", "outra",
+    "outros", "outras", "qualquer", "cada", "muito", "muita",
+    "muitos", "muitas", "tao",
+    # dêixis
+    "ja", "la", "ca", "ai", "aqui", "ali", "isto", "isso", "aquilo",
+    "este", "esta", "esse", "essa", "aquele", "aquela",
+    # ruído web/raspagem
+    "https", "http", "www", "com", "ref", "via", "etc", "url",
+    "html", "htm", "pdf", "amp", "nbsp", "min", "max",
+    "sim", "nao", "talvez",
+    # meses abreviados (ruído temporal — analisar à parte se necessário)
+    "jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago",
+    "set", "out", "nov", "dez",
+    # unidades temporais
+    "ano", "anos", "dia", "dias", "mes", "meses", "semana",
+    "semanas", "hora", "horas", "minuto", "minutos",
+    # numerais por extenso
+    "primeiro", "segundo", "terceiro", "ultimo", "ultima",
+    "primeira", "segunda", "terceira",
+    # genérico-jornalístico
+    "noticia", "noticias", "ultimas", "tudo", "feira",
+}
+STOPWORDS_PT = PT_STOP | CUSTOM_STOP
+ 
+# ============================================================
+# FUNÇÕES DE PRÉ-PROCESSAMENTO
+# ============================================================
+def normalize(text):
+    """Lowercase, remove acentos, URLs, pontuação e espaços extras."""
+    if not isinstance(text, str):
+        return ""
+    text = text.lower()
+    text = unicodedata.normalize("NFKD", text).encode("ASCII", "ignore").decode("ASCII")
+    text = re.sub(r"http\S+", " ", text)
+    text = re.sub(r"[^a-z\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+ 
+ 
+def tokenize(text, min_len=3):
+    """Tokenização + remoção de stopwords + filtro de tamanho mínimo."""
+    return [t for t in normalize(text).split()
+            if len(t) >= min_len and t not in STOPWORDS_PT]
+ 
+ 
+def extract_domain(url):
+    """Extrai o domínio (sem 'www.') a partir de uma URL."""
+    try:
+        netloc = urlparse(str(url)).netloc.lower()
+        netloc = re.sub(r"^www\.", "", netloc)
+        return netloc or "(sem-dominio)"
+    except Exception:
+        return "(sem-dominio)"
+ 
+ 
+def safe_sheet(name):
+    """Sanitiza nome de aba do Excel (máx. 31 chars, sem caracteres proibidos)."""
+    name = re.sub(r"[:\\/?*\[\]]", "_", str(name))
+    return name[:31]
+ 
+ 
+# ============================================================
+# 1. CARGA E PRÉ-PROCESSAMENTO
+# ============================================================
+print("[1/7] Carregando e pré-processando corpus...")
+df = pd.read_excel(INPUT_PATH)
+df["texto"] = (df[TEXT_COLS[0]].fillna("").astype(str) + " "
+               + df[TEXT_COLS[1]].fillna("").astype(str)).str.strip()
+df["texto_norm"] = df["texto"].apply(normalize)
+df["tokens"] = df["texto"].apply(tokenize)
+df["dominio"] = df[URL_COL].apply(extract_domain)
+print(f"   {len(df)} documentos | queries: {df[QUERY_COL].unique().tolist()}")
+print(f"   distribuição: {df[QUERY_COL].value_counts().to_dict()}")
+ 
+# ============================================================
+# 2. TF-IDF GERAL E POR QUERY
+# ============================================================
+print("[2/7] Calculando TF-IDF (geral + por query)...")
+ 
+def compute_tfidf(corpus, top_n=50, max_features=5000):
+    vec = TfidfVectorizer(
+        tokenizer=tokenize,
+        token_pattern=None,
+        lowercase=False,
+        max_features=max_features,
+    )
+    mat = vec.fit_transform(corpus.fillna(""))
+    scores = np.asarray(mat.sum(axis=0)).flatten()
+    terms = vec.get_feature_names_out()
+    return (pd.DataFrame({"termo": terms, "score_tfidf": scores})
+              .sort_values("score_tfidf", ascending=False)
+              .head(top_n)
+              .reset_index(drop=True))
+ 
+tfidf_geral = compute_tfidf(df["texto"], top_n=TOP_N_TFIDF)
+tfidf_por_query = {q: compute_tfidf(df[df[QUERY_COL] == q]["texto"], top_n=TOP_N_TFIDF)
+                   for q in df[QUERY_COL].unique()}
+ 
+# ============================================================
+# 3. TERMOS DISTINTIVOS — log-odds com prior Dirichlet informativo
+#    (Monroe, Colaresi & Quinn 2008, "Fightin' Words")
+#    Vantagem sobre TF-IDF para comparação entre grupos: controla
+#    o efeito do tamanho diferencial dos subcorpora e a variância
+#    de termos raros.
+# ============================================================
+print("[3/7] Calculando vocabulário distintivo por query (log-odds Dirichlet)...")
+ 
+def log_odds_dirichlet(target_counts, other_counts, alpha=0.01, min_total=3):
+    n_t = sum(target_counts.values())
+    n_o = sum(other_counts.values())
+    vocab = set(target_counts) | set(other_counts)
+    a0 = alpha * len(vocab)
+    results = []
+    for w in vocab:
+        y_t = target_counts.get(w, 0)
+        y_o = other_counts.get(w, 0)
+        if y_t + y_o < min_total:
+            continue
+        num_t = y_t + alpha
+        den_t = n_t + a0 - y_t - alpha
+        num_o = y_o + alpha
+        den_o = n_o + a0 - y_o - alpha
+        log_odds = np.log(num_t / den_t) - np.log(num_o / den_o)
+        var = 1.0 / (y_t + alpha) + 1.0 / (y_o + alpha)
+        z = log_odds / np.sqrt(var)
+        results.append((w, y_t, y_o, log_odds, z))
+    return pd.DataFrame(results, columns=["termo", "freq_target",
+                                          "freq_outras", "log_odds", "z_score"])
+ 
+all_tokens_by_query = {q: Counter() for q in df[QUERY_COL].unique()}
+for q in df[QUERY_COL].unique():
+    for toks in df[df[QUERY_COL] == q]["tokens"]:
+        all_tokens_by_query[q].update(toks)
+ 
+distintivos = {}
+for q in df[QUERY_COL].unique():
+    others = Counter()
+    for q2, c in all_tokens_by_query.items():
+        if q2 != q:
+            others.update(c)
+    res = log_odds_dirichlet(all_tokens_by_query[q], others)
+    distintivos[q] = (res.sort_values("z_score", ascending=False)
+                        .head(TOP_N_DISTINCTIVE)
+                        .reset_index(drop=True))
+ 
+# ============================================================
+# 4. COOCORRÊNCIA — janela = documento, vocabulário = top TF-IDF
+# ============================================================
+print("[4/7] Calculando matriz de coocorrência...")
+ 
+vocab_cooc = tfidf_geral["termo"].head(TOP_N_COOC).tolist()
+vocab_idx = {w: i for i, w in enumerate(vocab_cooc)}
+cooc = np.zeros((len(vocab_cooc), len(vocab_cooc)), dtype=int)
+ 
+for toks in df["tokens"]:
+    presentes = set(toks) & set(vocab_cooc)
+    for w in presentes:
+        cooc[vocab_idx[w], vocab_idx[w]] += 1
+    for w1, w2 in combinations(sorted(presentes), 2):
+        i, j = vocab_idx[w1], vocab_idx[w2]
+        cooc[i, j] += 1
+        cooc[j, i] += 1
+ 
+cooc_df = pd.DataFrame(cooc, index=vocab_cooc, columns=vocab_cooc)
+ 
+pares = []
+for i, w1 in enumerate(vocab_cooc):
+    for j, w2 in enumerate(vocab_cooc):
+        if i < j and cooc[i, j] > 0:
+            pares.append((w1, w2, int(cooc[i, j])))
+top_pares_df = (pd.DataFrame(pares, columns=["termo_1", "termo_2", "coocorrencia"])
+                  .sort_values("coocorrencia", ascending=False)
+                  .head(60).reset_index(drop=True))
+ 
+# ============================================================
+# 5. REDE DE DOMÍNIOS (bipartida query <-> domínio)
+# ============================================================
+print("[5/7] Construindo rede de domínios...")
+ 
+dom_freq = df["dominio"].value_counts().reset_index()
+dom_freq.columns = ["dominio", "frequencia"]
+ 
+queries_unique = df[QUERY_COL].unique().tolist()
+dom_por_query = df.groupby(["dominio", QUERY_COL]).size().unstack(fill_value=0)
+for q in queries_unique:
+    if q not in dom_por_query.columns:
+        dom_por_query[q] = 0
+dom_por_query["total"] = dom_por_query[queries_unique].sum(axis=1)
+dom_por_query["n_queries_compartilhadas"] = (dom_por_query[queries_unique] > 0).sum(axis=1)
+dom_por_query = dom_por_query.sort_values("total", ascending=False)
+ 
+dom_por_categoria = (df.groupby([SOURCE_CATEGORY_COL, "dominio"]).size()
+                       .reset_index(name="ocorrencias")
+                       .sort_values("ocorrencias", ascending=False))
+ 
+G = nx.Graph()
+for q in queries_unique:
+    G.add_node(q, tipo="query")
+for d in df["dominio"].unique():
+    G.add_node(d, tipo="dominio")
+edge_w = df.groupby([QUERY_COL, "dominio"]).size().reset_index(name="peso")
+for _, r in edge_w.iterrows():
+    G.add_edge(r[QUERY_COL], r["dominio"], weight=int(r["peso"]))
+ 
+degree_w = dict(G.degree(weight="weight"))
+degree_df = (pd.DataFrame(
+    [(n, degree_w[n], G.nodes[n].get("tipo", "")) for n in G.nodes],
+    columns=["no", "grau_ponderado", "tipo"])
+    .sort_values("grau_ponderado", ascending=False)
+    .reset_index(drop=True))
+ 
+# ============================================================
+# 6. CATEGORIAS DE FONTE POR QUERY
+# ============================================================
+cat_query = df.groupby([SOURCE_CATEGORY_COL, QUERY_COL]).size().unstack(fill_value=0)
+for q in queries_unique:
+    if q not in cat_query.columns:
+        cat_query[q] = 0
+cat_query = cat_query[queries_unique]
+cat_query_pct = (cat_query.div(cat_query.sum(axis=0), axis=1) * 100).round(2)
+ 
+# ============================================================
+# 7. VISUALIZAÇÕES
+# ============================================================
+print("[6/7] Gerando figuras PNG...")
+sns.set_theme(style="white", context="paper")
+ 
+# 7.1 TF-IDF geral
+plt.figure(figsize=(9, 8))
+sns.barplot(data=tfidf_geral.head(25), y="termo", x="score_tfidf", color="#4878A6")
+plt.title("Top 25 termos por TF-IDF — corpus completo")
+plt.xlabel("score TF-IDF"); plt.ylabel("")
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "fig_01_tfidf_geral.png", dpi=200)
+plt.close()
+ 
+# 7.2 TF-IDF por query (lado a lado)
+fig, axes = plt.subplots(1, len(tfidf_por_query), figsize=(18, 8))
+if len(tfidf_por_query) == 1:
+    axes = [axes]
+for ax, (q, rank) in zip(axes, tfidf_por_query.items()):
+    sns.barplot(data=rank.head(20), y="termo", x="score_tfidf", ax=ax, color="#4878A6")
+    ax.set_title(f"Query: {q}", fontsize=12)
+    ax.set_xlabel("TF-IDF"); ax.set_ylabel("")
+plt.suptitle("Top 20 termos por TF-IDF, por query", y=1.02, fontsize=14)
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "fig_02_tfidf_por_query.png", dpi=200, bbox_inches="tight")
+plt.close()
+ 
+# 7.3 Coocorrência (heatmap)
+plt.figure(figsize=(13, 11))
+sns.heatmap(cooc_df, cmap="magma", square=True,
+            cbar_kws={"label": "coocorrência (nº documentos)"})
+plt.title(f"Matriz de coocorrência — top {TOP_N_COOC} termos por TF-IDF")
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "fig_03_coocorrencia.png", dpi=200)
+plt.close()
+ 
+# 7.4 Termos distintivos por query
+fig, axes = plt.subplots(1, len(distintivos), figsize=(18, 9))
+if len(distintivos) == 1:
+    axes = [axes]
+for ax, (q, res) in zip(axes, distintivos.items()):
+    sns.barplot(data=res.head(15), y="termo", x="z_score", ax=ax, color="#C44E52")
+    ax.set_title(f"Distintivos — {q}", fontsize=12)
+    ax.set_xlabel("z-score (log-odds Dirichlet)"); ax.set_ylabel("")
+plt.suptitle("Vocabulário característico de cada query", y=1.02, fontsize=14)
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "fig_04_distintivos.png", dpi=200, bbox_inches="tight")
+plt.close()
+ 
+# 7.5 Rede de domínios — queries ancoradas em triângulo, domínios via força
+plt.figure(figsize=(17, 13))
+dom_keep = set(dom_freq[dom_freq["frequencia"] >= 2]["dominio"])
+nodes_keep = list(dom_keep) + queries_unique
+H = G.subgraph(nodes_keep).copy()
+ 
+anchor_angles = np.linspace(np.pi/2, np.pi/2 + 2*np.pi, len(queries_unique), endpoint=False)
+anchor_pos = {q: (3.0*np.cos(a), 3.0*np.sin(a))
+              for q, a in zip(sorted(queries_unique), anchor_angles)}
+pos = nx.spring_layout(H, pos=anchor_pos, fixed=list(anchor_pos.keys()),
+                       k=1.5, seed=42, weight="weight", iterations=200)
+ 
+q_nodes = [n for n in H.nodes if H.nodes[n].get("tipo") == "query"]
+d_nodes = [n for n in H.nodes if H.nodes[n].get("tipo") == "dominio"]
+d_sizes = [80 + 100 * degree_w.get(n, 1) for n in d_nodes]
+edge_widths = [0.3 + 0.7 * H[u][v]["weight"] for u, v in H.edges]
+ 
+nx.draw_networkx_edges(H, pos, alpha=0.22, width=edge_widths)
+nx.draw_networkx_nodes(H, pos, nodelist=d_nodes, node_size=d_sizes,
+                       node_color="#4878A6", alpha=0.75,
+                       edgecolors="white", linewidths=0.5)
+nx.draw_networkx_nodes(H, pos, nodelist=q_nodes, node_size=3000,
+                       node_color="#C44E52", alpha=0.92,
+                       edgecolors="white", linewidths=1.8)
+# Rótulos das queries deslocados radialmente para fora
+q_label_pos = {}
+for n in q_nodes:
+    x, y = pos[n]
+    norm = (x**2 + y**2) ** 0.5 or 1.0
+    q_label_pos[n] = (x + 0.55 * x/norm, y + 0.55 * y/norm)
+nx.draw_networkx_labels(H, q_label_pos, labels={n: n for n in q_nodes},
+                        font_size=16, font_weight="bold", font_color="#C44E52")
+# Rotular apenas domínios com grau ponderado >= 3
+top_dom_labels = {n: n for n in d_nodes if degree_w.get(n, 0) >= 3}
+label_pos = {n: (pos[n][0], pos[n][1] - 0.06) for n in top_dom_labels}
+nx.draw_networkx_labels(H, label_pos, labels=top_dom_labels, font_size=8.5,
+                        bbox=dict(boxstyle="round,pad=0.15", fc="white",
+                                  ec="none", alpha=0.7))
+plt.axis("off")
+plt.title("Rede bipartida query — domínio  (apenas domínios com ≥2 ocorrências; "
+          "rótulos visíveis: grau ponderado ≥3)", fontsize=13)
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "fig_05_rede_dominios.png", dpi=200)
+plt.close()
+ 
+# 7.6 Categorias de fonte por query (% da query)
+plt.figure(figsize=(11, 7))
+cat_query_pct.plot(kind="bar", color=["#4878A6", "#C44E52", "#55A868"],
+                   ax=plt.gca(), width=0.8)
+plt.title("Distribuição de categorias de fonte por query (% dentro de cada query)")
+plt.ylabel("% dos resultados da query"); plt.xlabel("")
+plt.xticks(rotation=30, ha="right"); plt.legend(title="query")
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "fig_06_categorias_por_query.png", dpi=200)
+plt.close()
+ 
+# 7.7 Wordclouds (opcional)
+if HAS_WORDCLOUD:
+    for q in queries_unique:
+        all_tokens = []
+        for toks in df[df[QUERY_COL] == q]["tokens"]:
+            all_tokens.extend(toks)
+        text = " ".join(all_tokens)
+        if not text:
+            continue
+        wc = WordCloud(width=1600, height=800, background_color="white",
+                       colormap="viridis", max_words=200,
+                       collocations=False).generate(text)
+        plt.figure(figsize=(16, 8))
+        plt.imshow(wc, interpolation="bilinear"); plt.axis("off")
+        plt.title(f"Wordcloud — {q}", fontsize=14)
+        plt.savefig(OUTPUT_DIR / f"fig_07_wordcloud_{q}.png",
+                    dpi=200, bbox_inches="tight")
+        plt.close()
+ 
+# ============================================================
+# 8. EXPORTAÇÃO — PLANILHA ÚNICA COM 16 ABAS
+# ============================================================
+print("[7/7] Exportando planilha consolidada...")
+ 
+with pd.ExcelWriter(OUT_XLSX, engine="openpyxl") as writer:
+    # 00 — corpus de trabalho (após pré-processamento)
+    df_export = df.drop(columns=["tokens"]).copy()
+    df_export.to_excel(writer, sheet_name="00_dados_base", index=False)
+ 
+    # 01 — TF-IDF geral
+    tfidf_geral.to_excel(writer, sheet_name="01_tfidf_geral", index=False)
+    # 02 — TF-IDF por query
+    for q, rank in tfidf_por_query.items():
+        rank.to_excel(writer, sheet_name=safe_sheet(f"02_tfidf_{q}"), index=False)
+ 
+    # 03 — Distintivos por query
+    for q, res in distintivos.items():
+        res.to_excel(writer, sheet_name=safe_sheet(f"03_distintivos_{q}"), index=False)
+ 
+    # 04 — Coocorrência
+    cooc_df.to_excel(writer, sheet_name="04_cooc_matriz")
+    top_pares_df.to_excel(writer, sheet_name="04_cooc_top_pares", index=False)
+ 
+    # 05 — Domínios e rede
+    dom_freq.to_excel(writer, sheet_name="05_dominios_frequencia", index=False)
+    dom_por_query.reset_index().to_excel(writer, sheet_name="05_dominios_por_query", index=False)
+    dom_por_categoria.to_excel(writer, sheet_name="05_dominios_por_categ", index=False)
+    degree_df.to_excel(writer, sheet_name="05_rede_grau", index=False)
+ 
+    # 06 — Categorias de fonte x query
+    cat_query.reset_index().to_excel(writer, sheet_name="06_categ_x_query_n", index=False)
+    cat_query_pct.reset_index().to_excel(writer, sheet_name="06_categ_x_query_pct", index=False)
+ 
+print(f"\n✓ Concluído. Saída em: {OUTPUT_DIR}")
+print(f"  - {OUT_XLSX.name}")
+for p in sorted(OUTPUT_DIR.glob("fig_*.png")):
+    print(f"  - {p.name}")
